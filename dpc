@@ -1,0 +1,199 @@
+#! /usr/bin/perl
+
+sub usage(){
+print <<EOF
+dpc - DataPrime Client
+
+A nifty little tool for running dataprime queries and getting back some YAML or JSON
+to feed into yq, jq or some other processing tool
+
+Usage:
+
+dpc -q [query] -r [region] -k [api-key]
+dpc -f [file] -r [region] -k [api-key] -o yaml
+dpc [options]
+
+Connection to Coralogix:
+ -k, --key [string]     API key
+ -r, --region [string]  Coralogix region (US1, EU1 etc.); used to determine endpoint
+     --endpoint [url]   Use specified endpoint URL, rather than working it out from region
+
+The API key may be set using an environment variable CX_API_KEY, and the region may be
+set with an environment variable CX_REGION.
+
+Query and result:
+ -q, --query [string]   Data Prime query string to execute
+ -f, --queryfile [path] File containing (possibly multi-line) Data Prime query to execute
+ -t, --tier [name]      Tier to search; `archive` or `frequent`
+     --from [datestamp] Beginning of search time range
+     --to [datestamp]   End of search time range
+ -o, --output [format]  Format for query results; `yaml` or `json`, defaults to yaml
+     --body             Return only the userData.body field (hopefully the log line)
+     --labels           Include `labels` field on each result
+     --metadata         Include `metadata` field on each result
+
+Timeframe-wise, the behaviour of the API is that:
+  * in the absence of --from and of --to, the last 15min is searched
+  * given --from but not --to, the 15min from the `from` time is searched
+  * given --to but not --from, the 15min preceeding the `to` time is searched
+
+The lines of a queryfile will be concatenated into a single line before submission
+
+EOF
+}
+
+use 5.038;
+use strict;
+use warnings;
+
+use Getopt::Long;
+use JSON;           # apt-get install libjson-perl
+use LWP::UserAgent; # apt-get install libwww-perl
+use YAML qw/Dump/;  # apt-get install libyaml-perl
+
+our $VERSION = '0.0.1';
+
+my %cx_endpoints = (
+    'EU1' => 'https://ng-api-http.coralogix.com/api/v1/dataprime/query',
+    'AP1' => 'https://ng-api-http.app.coralogix.in/api/v1/dataprime/query',
+    'US1' => 'https://ng-api-http.coralogix.us/api/v1/dataprime/query',
+    'EU2' => 'https://ng-api-http.eu2.coralogix.com/api/v1/dataprime/query',
+    'AP2' => 'https://ng-api-http.coralogixsg.com/api/v1/dataprime/query',
+    'US2' => 'https://ng-api-http.cx498.coralogix.com/api/v1/dataprime/query',
+    'AP3' => 'https://ng-api-http.ap3.coralogix.com/api/v1/dataprime/query',
+);
+
+my %cx_tiers = (
+    archive => 'TIER_ARCHIVE',
+    frequent => 'TIER_FREQUENT_SEARCH',
+);
+
+my $cx_endpoint = undef;
+my $from_timestamp = undef;
+my $help = undef;
+my $cx_api_key = undef;
+my $include_labels = undef;
+my $include_metadata = undef;
+my $just_body = undef;
+my $use_lucene = undef;
+my $output_format = 'yaml';
+my $query = undef;
+my $query_file = undef;
+my $cx_region = undef;
+my $cx_tier = undef;
+my $to_timestamp = undef;
+
+$cx_api_key = $ENV{CX_API_KEY} if $ENV{CX_API_KEY};
+$cx_region = $ENV{CX_REGION} if $ENV{CX_REGION};
+
+GetOptions(
+    'endpoint=s'    => \$cx_endpoint,
+    'from=s'        => \$from_timestamp,
+    'help|h'        => \$help,
+    'key|k=s'       => \$cx_api_key,
+    'labels'        => \$include_labels,
+    'metadata'      => \$include_metadata,
+    'body|b'        => \$just_body,
+    'output|o=s'    => \$output_format,
+    'query|q=s'     => \$query,
+    'queryfile|f=s' => \$query_file,
+    'region|r=s'    => \$cx_region,
+    'tier|t=s'      => \$cx_tier,
+    'to=s'          => \$to_timestamp,
+) or die ("Failed to parse command-line options: $!");
+usage() if $help;
+
+$query = read_query_from_file($query_file) if ($query_file);
+
+abort('Query must be provided with --query or -q, or in a file passed with --queryfile or -f') unless $query;
+abort('API key must be provided with --key or by setting CX_API_KEY env var') unless $cx_api_key;
+abort('Region must be provided with --region or by setting CX_REGION (one of ' . join(', ', sort(keys(%cx_endpoints))) .')') unless $cx_region or $cx_endpoint;
+abort("Output format must be one of 'yaml' or 'json', not '$output_format'") unless $output_format eq 'yaml' or $output_format eq 'json';
+abort("Invalid tier '$cx_tier'; if supplied must be one of " . join(', ', sort(keys(%cx_tiers)))) if $cx_tier and not $cx_tiers{$cx_tier};
+
+abort("Invalid --from timestamp, must be YYYY-MM-DDThh:mm:ssZ") if $from_timestamp and $from_timestamp !~ m/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+abort("Invalid --to timestamp, must be YYYY-MM-DDThh:mm:ssZ")   if $to_timestamp   and $to_timestamp   !~ m/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+$cx_endpoint = $cx_endpoints{$cx_region} unless($cx_endpoint);
+
+my $ua = LWP::UserAgent->new();
+$ua->agent('cx-query/' . $VERSION);
+
+my $query_body = { query => $query };
+$query_body->{metadata}->{tier} = $cx_tiers{$cx_tier} if $cx_tier;
+$query_body->{metadata}->{startDate} = $from_timestamp if $from_timestamp;
+$query_body->{metadata}->{endDate} = $to_timestamp if $to_timestamp;
+
+my $results = run_query($query_body, $cx_endpoint, $cx_api_key);
+print format_output($output_format, $results);
+
+# # #
+# #
+#
+
+sub format_output($format, $results){
+    return JSON->new->pretty->encode($results) if($format eq 'json');
+    return Dump($results) if($format eq 'yaml');
+}
+
+sub run_query($body, $endpoint, $key){
+    debug(encode_json($body));
+    my $req = HTTP::Request->new(POST => $endpoint);
+    $req->header('content-type' => 'application/json');
+    $req->header('authorization' => 'Bearer ' . $key);
+    $req->content(encode_json($body));
+
+
+    my $resp = $ua->request($req);
+    unless ($resp->is_success) {
+        error('Failed to run query. Query:');
+        error(encode_json($body));
+        abort('[' . $resp->code . '] '.$resp->message);
+    }
+    my @lines = split(m/\n/, $resp->content);
+    debug($lines[0]);
+
+    my $result = decode_json($lines[1]);
+    my $results = $result->{result}->{results};
+    my @new_results;
+    foreach my $entry (@{$results}){
+        my $userData = JSON->new->decode($entry->{userData});
+        my $new_entry = {};
+        if($just_body){
+            $new_entry->{body} = $userData->{body};
+        }else{
+            $new_entry->{userData} = $userData;
+            $new_entry->{metadata} = $entry->{metadata} if $include_metadata;
+            $new_entry->{labels}   = $entry->{labels}   if $include_labels;
+        }
+        push(@new_results, $new_entry);
+    }
+    return \@new_results;
+}
+
+sub read_query_from_file($filename){
+    open (my $fh, '<', $filename) or abort("Failed to open file '$filename': $!");
+    my $querystring = '';
+    while (my $line = readline($fh)){
+        chomp($line);
+        $querystring.=' '.$line;
+    }
+    return $querystring;
+}
+
+sub debug($msg){
+    return unless $ENV{'DEBUG'};
+    chomp($msg);
+    say STDERR "DEBUG: " . $msg;
+}
+
+sub error($msg){
+    chomp($msg);
+    say STDERR "ERROR: " . $msg;
+}
+
+sub abort($msg){
+    error($msg);
+    error('Aborting');
+    exit 1;
+}
